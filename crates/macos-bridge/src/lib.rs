@@ -1259,7 +1259,8 @@ mod tests {
             assert_eq!(s.store.profile(id).unwrap().unwrap().traffic_dl, 12);
             assert!(s.mutable().is_err());
             // Independent measurement slots remain available while connected.
-            s.request(json!({"op":"test_latency","ids":[id,id]})).unwrap();
+            s.request(json!({"op":"test_latency","ids":[id,id]}))
+                .unwrap();
             assert_eq!(s.snapshot().unwrap()["latency_progress"]["total"], 1);
             s.request(json!({"op":"speed_test","id":id})).unwrap();
             s.request(json!({"op":"check_config","id":id})).unwrap();
@@ -1381,7 +1382,8 @@ mod tests {
         assert!(s.store.group(gid).unwrap().unwrap().sub_last_update > 0);
 
         s.subscription = Some(pending(true));
-        let result = Ok(nolurix_config::subscription::parse("trojan://pw@b.example:443#b").unwrap());
+        let result =
+            Ok(nolurix_config::subscription::parse("trojan://pw@b.example:443#b").unwrap());
         s.reduce_report(Event::Subscription { gid, result });
         assert_eq!(s.selected, 0);
         assert_eq!(s.settings.last_profile_id, 0);
