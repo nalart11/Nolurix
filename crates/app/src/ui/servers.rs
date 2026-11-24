@@ -25,8 +25,10 @@ pub struct ServersPage {
     /// g_object_notify_by_pspec.
     groups_model: gtk::StringList,
     group_info: gtk::Label,
+    ping_progress: gtk::Label,
     test_button: gtk::Button,
     update_button: gtk::Button,
+    updating_gid: std::cell::Cell<Option<i64>>,
     search: gtk::SearchEntry,
     empty: adw::StatusPage,
     scroller: gtk::ScrolledWindow,
@@ -101,6 +103,14 @@ impl ServersPage {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["section-label"])
             .build();
+        let ping_progress = gtk::Label::builder()
+            .xalign(1.0)
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(4)
+            .css_classes(["dim-label", "numeric"])
+            .visible(false)
+            .build();
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -117,8 +127,8 @@ impl ServersPage {
             .icon_name("network-server-symbolic")
             .title(tr("Здесь пока пусто", "No servers yet"))
             .description(tr(
-                "Добавьте подписку или вставьте ссылку на сервер кнопкой «+» в шапке.",
-                "Use the “+” button in the header to add a subscription or paste a server link.",
+                "Нажмите «+», чтобы добавить подписку, ссылку на сервер или JSON.",
+                "Use “+” to add a subscription, server link, or JSON.",
             ))
             .vexpand(true)
             .build();
@@ -128,6 +138,7 @@ impl ServersPage {
             .build();
         widget.append(&toolbar);
         widget.append(&group_info);
+        widget.append(&ping_progress);
         widget.append(&scroller);
         widget.append(&empty);
 
@@ -138,8 +149,10 @@ impl ServersPage {
             groups_drop,
             groups_model,
             group_info,
+            ping_progress,
             test_button,
             update_button,
+            updating_gid: std::cell::Cell::new(None),
             search,
             empty,
             scroller,
@@ -557,10 +570,12 @@ impl ServersPage {
         let group = self.state.store.borrow().group(gid).ok().flatten();
         let Some(group) = group else {
             self.group_info.set_label("");
+            self.update_button.set_sensitive(false);
             return;
         };
 
-        self.update_button.set_sensitive(group.is_subscription());
+        self.update_button
+            .set_sensitive(group.is_subscription() && self.updating_gid.get() != Some(gid));
         if !group.is_subscription() {
             self.group_info
                 .set_label(tr("Ручная группа", "Manual group"));
@@ -653,6 +668,10 @@ impl ServersPage {
     }
 
     pub fn set_testing(&self, testing: bool) {
+        self.ping_progress.set_visible(testing);
+        if !testing {
+            self.ping_progress.set_label("");
+        }
         self.test_button.set_icon_name(if testing {
             "process-stop-symbolic"
         } else {
@@ -668,8 +687,16 @@ impl ServersPage {
         }));
     }
 
-    pub fn set_updating(&self, updating: bool) {
-        self.update_button.set_sensitive(!updating);
+    pub fn set_ping_progress(&self, completed: usize, total: usize) {
+        self.ping_progress.set_label(&crate::tr_format!(
+            "Пинг: {completed} из {total}",
+            "Ping: {completed} of {total}"
+        ));
+    }
+
+    pub fn set_updating(&self, gid: Option<i64>) {
+        self.updating_gid.set(gid);
+        self.refresh_group_info();
     }
 }
 

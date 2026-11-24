@@ -710,33 +710,44 @@ async fn latency_job(
             xray_config: Some(generated.xray_config.clone()),
             ..Default::default()
         };
-        let response = test_rpc(cancel, &core.client, core.client.test(request)).await?;
         let mut tested = 0;
-        for result in response.results {
-            if cancel.requested() {
-                return Err(cancelled());
-            }
-            let Some(index) = generated
-                .tags
-                .iter()
-                .position(|tag| tag == result.outbound_tag())
-            else {
-                continue;
-            };
-            let Some(&id) = ids.get(index) else { continue };
-            let latency = if result.error().is_empty() {
-                result.latency_ms().max(1)
-            } else {
-                -1
-            };
-            if !output
-                .session(cancel, Event::LatencyResult { id, latency })
-                .await
-            {
-                return Err(cancelled());
-            }
-            tested += 1;
-        }
+        test_rpc(
+            cancel,
+            &core.client,
+            core.client.test_incremental(request, |result| {
+                let outcome = (|| {
+                    if cancel.requested() {
+                        return Err(cancelled());
+                    }
+                    let Some(index) = generated
+                        .tags
+                        .iter()
+                        .position(|tag| tag == result.outbound_tag())
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(&id) = ids.get(index) else {
+                        return Ok(None);
+                    };
+                    let latency = if result.error().is_empty() {
+                        result.latency_ms().max(1)
+                    } else {
+                        -1
+                    };
+                    tested += 1;
+                    Ok(Some(Event::LatencyResult { id, latency }))
+                })();
+                async move {
+                    if let Some(event) = outcome? {
+                        if !output.session(cancel, event).await {
+                            return Err(cancelled());
+                        }
+                    }
+                    Ok(())
+                }
+            }),
+        )
+        .await?;
         Ok(tested)
     }
     .await;

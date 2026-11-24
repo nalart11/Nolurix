@@ -49,7 +49,60 @@ struct MainView: View {
     private func nav(_ id:String,_ icon:String,_ label:String)->some View { Button { m.tab=id } label:{Label(label,systemImage:icon).frame(maxWidth:.infinity,alignment:.leading).padding(9).contentShape(RoundedRectangle(cornerRadius:8)).background(m.tab == id ? Color.accentColor.opacity(0.13):.clear,in:RoundedRectangle(cornerRadius:8))}.buttonStyle(.plain).accessibilityLabel(label) }
     private var statusKind:String { m.status["kind"] as? String ?? "disconnected" }
     private var statusIcon:String { statusKind == "connected" ? "checkmark.circle.fill" : statusKind == "connecting" ? "arrow.triangle.2.circlepath" : statusKind == "failed" ? "exclamationmark.circle.fill" : "circle" }
-    private var header: some View { HStack { VStack(alignment:.leading,spacing:3){Text(title).font(.system(size:26,weight:.bold,design:.rounded));Text(subtitle).font(.subheadline).foregroundStyle(.secondary);if let stage=m.snapshot["speed_stage"] as? String,!stage.isEmpty {Text(stage).font(.caption).foregroundStyle(.secondary)} else if m.snapshot["testing"] as? Bool == true {Text(m.tr("Проверка задержки…","Testing latency…")).font(.caption).foregroundStyle(.secondary)}}; Spacer(); if m.tab == "profiles" { Button { chooseImport() } label:{Label(m.tr("Импорт","Import"),systemImage:"square.and.arrow.down")}; Button { addProfile() } label:{Label(m.tr("Добавить","Add"),systemImage:"plus")};Button {if m.snapshot["testing"] as? Bool == true {m.command("stop_test")}else{m.command("test_latency",["ids":[],"gid":groupID])}} label:{Image(systemName:(m.snapshot["testing"] as? Bool ?? false) ? "stop.fill":"waveform.path.ecg")}.help((m.snapshot["testing"] as? Bool ?? false) ? m.tr("Остановить проверку","Stop latency tests"):m.tr("Проверить задержку","Test latency")).accessibilityLabel((m.snapshot["testing"] as? Bool ?? false) ? m.tr("Остановить проверку","Stop latency tests"):m.tr("Проверить задержку","Test latency")).disabled(m.busy) }; if statusKind == "connected" || statusKind == "connecting" { Button(m.tr("Отключить","Disconnect")){m.command("disconnect")}.buttonStyle(.bordered) } else if m.tab == "profiles" { Button(m.tr("Подключить","Connect")){connect()}.buttonStyle(.borderedProminent).keyboardShortcut(.return,modifiers:[]).disabled(m.busy || m.shutdownPending) } }.padding(.horizontal,28).padding(.vertical,20).background(.bar) }
+    private var refreshingGroupID: Int? { m.snapshot["subscription_refresh_gid"] as? Int }
+    private var testingLatency: Bool { m.snapshot["testing"] as? Bool == true }
+    private var header: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.system(size: 26, weight: .bold, design: .rounded))
+                Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
+                if let progress = m.snapshot["latency_progress"] as? [String: Int],
+                   let total = progress["total"], total > 0, let completed = progress["completed"] {
+                    ProgressView(value: Double(completed), total: Double(total)) {
+                        Text(m.tr("Проверка задержки", "Testing latency"))
+                    } currentValueLabel: {
+                        Text(m.tr("\(completed) из \(total) серверов", "\(completed) of \(total) servers"))
+                            .monospacedDigit()
+                    }
+                    .font(.caption)
+                    .frame(maxWidth: 240)
+                }
+                if let stage = m.snapshot["speed_stage"] as? String, !stage.isEmpty {
+                    Text(stage).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if m.tab == "profiles" {
+                Button { chooseImport() } label: { Label(m.tr("Импорт", "Import"), systemImage: "square.and.arrow.down") }
+                    .disabled(!m.ready || refreshingGroupID != nil)
+                Button { addProfile() } label: { Label(m.tr("Добавить", "Add"), systemImage: "plus") }
+                    .disabled(refreshingGroupID != nil || !groupIDs.contains(groupID))
+                let pingAction = testingLatency
+                    ? m.tr("Остановить проверку", "Stop latency tests")
+                    : m.tr("Проверить задержку", "Test latency")
+                Button {
+                    if testingLatency { m.command("stop_test") }
+                    else { m.command("test_latency", ["ids": [], "gid": groupID]) }
+                } label: {
+                    Image(systemName: testingLatency ? "stop.fill" : "waveform.path.ecg")
+                }
+                .help(pingAction)
+                .accessibilityLabel(pingAction)
+                .disabled(m.busy || refreshingGroupID != nil || (!testingLatency && !m.profiles.contains { ($0["gid"] as? Int) == groupID }))
+            }
+            if statusKind == "connected" || statusKind == "connecting" {
+                Button(m.tr("Отключить", "Disconnect")) { m.command("disconnect") }.buttonStyle(.bordered)
+            } else if m.tab == "profiles" {
+                Button(m.tr("Подключить", "Connect")) { connect() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [])
+                    .disabled(m.busy || m.shutdownPending || refreshingGroupID != nil)
+            }
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 20)
+        .background(.bar)
+    }
     private var profileSelection: Binding<Int?> { Binding(get: { let id=m.snapshot["selected_id"] as? Int ?? 0;return id == 0 ? nil : id }, set: { if let id=$0 {m.command("select",["id":id])} }) }
     private var groupIDs: [Int] { m.groups.compactMap { $0["id"] as? Int } }
     private func reconcileGroupSelection() {
@@ -57,11 +110,128 @@ struct MainView: View {
     }
     private var title:String { switch m.tab {case "profiles":return m.tr("Профили","Profiles");case "connections":return m.tr("Соединения","Connections");case "logs":return m.tr("Журнал","Logs");default:return m.tr("Настройки","Settings")} }
     private var subtitle:String { m.tr("Управляйте серверами и защищённым подключением","Manage your servers and secure connection") }
-    private var profileList:some View { VStack(spacing:0){ HStack{Image(systemName:"magnifyingglass").foregroundStyle(.secondary);TextField(m.tr("Поиск профилей","Search profiles"),text:$search).textFieldStyle(.plain); Picker(m.tr("Группа","Group"),selection:$groupID){ForEach(Array(m.groups.enumerated()),id:\.offset){_,g in Text(g["name"] as? String ?? m.tr("Группа","Group")).tag(g["id"] as? Int ?? 0)}}.frame(maxWidth:200); if let group=m.groups.first(where:{($0["id"] as? Int)==groupID}), !((group["url"] as? String ?? "").isEmpty) { Button { m.command("subscription_refresh",["gid":groupID]) } label:{Image(systemName:"arrow.clockwise")}.help(m.tr("Обновить подписку","Refresh subscription")).accessibilityLabel(m.tr("Обновить подписку","Refresh subscription")) };Menu{Button(m.tr("Новая группа или подписка","New group or subscription")){manageGroups()};if m.groups.contains(where:{($0["id"] as? Int)==groupID}){Button(m.tr("Изменить группу","Edit group")){editGroup()};Button(m.tr("Удалить группу","Delete group"),role:.destructive){confirmDeleteGroup=true}}}label:{Image(systemName:"folder.badge.plus")}.help(m.tr("Группы и подписки","Groups and subscriptions")).accessibilityLabel(m.tr("Группы и подписки","Groups and subscriptions")) }.padding(12).background(.background,in:RoundedRectangle(cornerRadius:12)).padding(.horizontal,24).padding(.top,16)
-        let filtered=m.profiles.filter{ProfileSearch.matches($0, groupID: groupID, query: search)}
-        if filtered.isEmpty { EmptyState(title:m.tr("Профилей пока нет","No profiles yet"),icon:"network",detail:m.tr("Добавьте ссылку или импортируйте старую базу данных.","Add a server link or import your legacy database.")).frame(maxHeight:.infinity) } else { List(selection: profileSelection) { if filtered.count > 1 { Button { m.command("select",["id":-groupID]) } label:{HStack{Label(m.tr("Автовыбор","Automatic selection"),systemImage:"sparkles");Spacer();Text((m.snapshot["auto_status"] as? [String:Any])?["selected"] as? String ?? "").font(.caption).foregroundStyle(.secondary)}}.padding(12).buttonStyle(.plain).tag(-groupID).onTapGesture(count:2){connect(id: -groupID)}.contextMenu{Button(m.tr("Снять закрепление","Unpin automatic selection")){m.command("auto_pin",["name":""])};Button(m.tr("Перепроверить серверы","Retest servers")){m.command("auto_recheck")} } }; ForEach(Array(filtered.enumerated()),id:\.offset){ _,p in ProfileRow(profile:p, connected:(m.status["profile_id"] as? Int)==(p["id"] as? Int)).tag(p["id"] as? Int ?? 0).contentShape(Rectangle()).onTapGesture(count:2){connect(id: p["id"] as? Int)}.contextMenu { Button(m.tr("Изменить","Edit")){edit(p)}; Button(m.tr("Замерить скорость","Test speed")){m.command("speed_test",["id":p["id"] ?? 0])}; Button(m.tr("Проверить конфигурацию","Check configuration")){m.command("check_config",["id":p["id"] ?? 0])}; Button(m.tr("Закрепить в автовыборе","Pin for automatic selection")){m.command("auto_pin",["name":p["name"] ?? ""])}; Button(m.tr("Экспорт конфигурации","Export configuration")){export(p)}; Button(m.tr("Удалить","Delete"),role:.destructive){pendingProfileDelete=p} } } }.listStyle(.inset).scrollContentBackground(.hidden) }
-        }.padding(.bottom,12) }
-    private func chooseImport(){ let panel=NSOpenPanel();panel.allowedContentTypes=[.database,.json,.data];panel.allowsMultipleSelection=false;panel.canChooseDirectories=false; if panel.runModal() == .OK,let url=panel.url { m.command("import_throne",["path":url.path]) } }
+    private var profileToolbar: some View {
+        HStack {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField(m.tr("Поиск профилей", "Search profiles"), text: $search).textFieldStyle(.plain)
+            Picker(m.tr("Группа", "Group"), selection: $groupID) {
+                ForEach(Array(m.groups.enumerated()), id: \.offset) { _, group in
+                    Text(group["name"] as? String ?? m.tr("Группа", "Group")).tag(group["id"] as? Int ?? 0)
+                }
+            }
+            .frame(maxWidth: 200)
+            if refreshingGroupID != nil {
+                let label = m.tr("Обновление подписки…", "Refreshing subscription…")
+                ProgressView().controlSize(.small).help(label).accessibilityLabel(label)
+            } else if let group = m.groups.first(where: { ($0["id"] as? Int) == groupID }),
+                      !(group["url"] as? String ?? "").isEmpty {
+                let label = m.tr("Обновить подписку", "Refresh subscription")
+                Button { m.command("subscription_refresh", ["gid": groupID]) } label: { Image(systemName: "arrow.clockwise") }
+                    .help(label)
+                    .accessibilityLabel(label)
+                    .disabled(m.busy || refreshingGroupID != nil || statusKind == "connected" || statusKind == "connecting" || testingLatency)
+            }
+            Menu {
+                Button(m.tr("Новая группа или подписка", "New group or subscription")) { manageGroups() }
+                if groupIDs.contains(groupID) {
+                    Button(m.tr("Изменить группу", "Edit group")) { editGroup() }
+                    Button(m.tr("Удалить группу", "Delete group"), role: .destructive) { confirmDeleteGroup = true }
+                }
+            } label: { Image(systemName: "folder.badge.plus") }
+                .help(m.tr("Группы и подписки", "Groups and subscriptions"))
+                .accessibilityLabel(m.tr("Группы и подписки", "Groups and subscriptions"))
+                .disabled(refreshingGroupID != nil)
+        }
+        .padding(12)
+        .background(.background, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+    }
+    private struct ProfileItem: Identifiable {
+        let id: Int
+        let data: [String: Any]
+    }
+    private var profileList: some View {
+        let filtered = m.profiles.compactMap { profile -> ProfileItem? in
+            guard let id = profile["id"] as? Int,
+                  ProfileSearch.matches(profile, groupID: groupID, query: search) else { return nil }
+            return ProfileItem(id: id, data: profile)
+        }
+        return VStack(spacing: 0) {
+            profileToolbar
+            if filtered.isEmpty {
+                EmptyState(
+                    title: m.tr("Профилей пока нет", "No profiles yet"),
+                    icon: "network",
+                    detail: m.tr("Добавьте ссылки на серверы или импортируйте файл JSON либо старую базу.", "Add server links or import a JSON file or legacy database.")
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                List(selection: profileSelection) {
+                    if filtered.count > 1 {
+                        Button { m.command("select", ["id": -groupID]) } label: {
+                            HStack {
+                                Label(m.tr("Автовыбор", "Automatic selection"), systemImage: "sparkles")
+                                Spacer()
+                                Text((m.snapshot["auto_status"] as? [String: Any])?["selected"] as? String ?? "")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(12).buttonStyle(.plain).tag(-groupID)
+                        .onTapGesture(count: 2) { connect(id: -groupID) }
+                        .contextMenu {
+                            Button(m.tr("Снять закрепление", "Unpin automatic selection")) { m.command("auto_pin", ["name": ""]) }
+                            Button(m.tr("Перепроверить серверы", "Retest servers")) { m.command("auto_recheck") }
+                        }
+                    }
+                    ForEach(filtered) { item in
+                        ProfileRow(profile: item.data, connected: (m.status["profile_id"] as? Int) == item.id)
+                            .tag(item.id)
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) { connect(id: item.id) }
+                            .contextMenu {
+                                Button(m.tr("Изменить", "Edit")) { edit(item.data) }.disabled(refreshingGroupID != nil)
+                                Button(m.tr("Замерить скорость", "Test speed")) { m.command("speed_test", ["id": item.id]) }.disabled(refreshingGroupID != nil)
+                                Button(m.tr("Проверить конфигурацию", "Check configuration")) { m.command("check_config", ["id": item.id]) }.disabled(refreshingGroupID != nil)
+                                Button(m.tr("Закрепить в автовыборе", "Pin for automatic selection")) { m.command("auto_pin", ["name": item.data["name"] ?? ""]) }
+                                Button(m.tr("Экспорт конфигурации", "Export configuration")) { export(item.data) }
+                                Button(m.tr("Удалить", "Delete"), role: .destructive) { pendingProfileDelete = item.data }.disabled(refreshingGroupID != nil)
+                            }
+                    }
+                }
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+            }
+        }
+        .padding(.bottom, 12)
+    }
+    private func chooseImport() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json, .database, .data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = m.tr("Выберите файл JSON или старую базу данных.", "Choose a JSON file or legacy database.")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+        guard url.pathExtension.lowercased() == "json" || contentType?.conforms(to: .json) == true else {
+            m.command("import_throne", ["path": url.path])
+            return
+        }
+        do {
+            // Bound the local read as well as the bridge's JSON request.
+            let limit = 4 * 1024 * 1024
+            let file = try FileHandle(forReadingFrom: url)
+            defer { try? file.close() }
+            let data = try file.read(upToCount: limit + 1) ?? Data()
+            guard data.count <= limit else {
+                throw BridgeFailure.response(m.tr("Файл JSON слишком большой.", "The JSON file is too large."))
+            }
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw BridgeFailure.response(m.tr("Файл JSON должен быть в кодировке UTF‑8.", "The JSON file must be UTF‑8."))
+            }
+            m.command("import_links", ["text": text, "gid": groupID])
+        } catch { m.setError(error) }
+    }
     private func address(_ p:[String:Any])->String { let o=p["outbound"] as? [String:Any] ?? [:];return "\(o["server"] as? String ?? o["protocol"] as? String ?? "") \(o["server_port"] as? Int ?? 0)" }
     private func export(_ p:[String:Any]) { m.command("export_config",["id":p["id"] ?? 0]) { result in let data=(try? JSONSerialization.data(withJSONObject:result ?? NSNull(),options:[.prettyPrinted,.sortedKeys])) ?? Data(String(describing:result ?? "").utf8);let text=String(decoding:data,as:UTF8.self);let alert=NSAlert();alert.messageText=m.tr("Конфигурация","Configuration");let view=NSScrollView(frame:NSRect(x:0,y:0,width:520,height:360));let editor=NSTextView(frame:view.bounds);editor.isEditable=false;editor.string=text;editor.font = .monospacedSystemFont(ofSize:11,weight:.regular);view.documentView=editor;alert.accessoryView=view;alert.addButton(withTitle:m.tr("OK","OK"));alert.runModal() } }
     private func groupForm(name: NSTextField, url: NSTextField) -> NSView {
@@ -127,12 +297,40 @@ struct MainView: View {
         warning.runModal()
     }
     private func connect(id: Int? = nil){
+        guard refreshingGroupID == nil else { return }
         var fields: [String:Any] = [:]
         if let id { fields["id"] = id }
         guard (m.settings["mode"] as? String) == "vpn" else { m.command("connect", fields); return }
         let alert=NSAlert();alert.messageText=m.tr("Подключить VPN?","Connect VPN?");alert.informativeText=m.tr("Для VPN macOS может запросить разрешение и открыть системные настройки. Продолжать?","macOS may ask for permission and open System Settings for VPN access. Continue?");alert.addButton(withTitle:m.tr("Продолжить","Continue"));alert.addButton(withTitle:m.tr("Отмена","Cancel"));if alert.runModal() == .alertFirstButtonReturn {fields["acknowledge_vpn"] = true;m.command("connect",fields)}
     }
-    private func addProfile(){ let alert=NSAlert();alert.messageText=m.tr("Добавить профили","Add profiles");alert.informativeText=m.tr("Вставьте ссылки на серверы","Paste server links");let field=NSTextView(frame:NSRect(x:0,y:0,width:360,height:110));field.font = .monospacedSystemFont(ofSize:12,weight:.regular);alert.accessoryView=field;alert.addButton(withTitle:m.tr("Импортировать","Import"));alert.addButton(withTitle:m.tr("Отмена","Cancel"));if alert.runModal() == .alertFirstButtonReturn {m.command("import_links",["text":field.string,"gid":groupID])} }
+    private func addProfile() {
+        let alert = NSAlert()
+        alert.messageText = m.tr("Добавить профили", "Add profiles")
+        let prompt = m.tr("Вставьте ссылки на серверы или конфигурацию JSON.", "Paste server links or a JSON configuration.")
+        alert.informativeText = prompt
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 430, height: 150))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let field = NSTextView(frame: scroll.bounds)
+        field.isRichText = false
+        field.isAutomaticQuoteSubstitutionEnabled = false
+        field.isAutomaticDashSubstitutionEnabled = false
+        field.isVerticallyResizable = true
+        field.autoresizingMask = [.width]
+        field.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        field.textContainer?.widthTracksTextView = true
+        field.textContainerInset = NSSize(width: 8, height: 8)
+        field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        field.setAccessibilityLabel(prompt)
+        scroll.documentView = field
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: m.tr("Импортировать", "Import"))
+        alert.addButton(withTitle: m.tr("Отмена", "Cancel"))
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            m.command("import_links", ["text": field.string, "gid": groupID])
+        }
+    }
     private func edit(_ p:[String:Any]) { ProfileEditor(profile:p,ru:m.language == "ru"){m.command("profile_save",["profile":$0])}.open() }
 }
 

@@ -8,10 +8,10 @@ use crate::engine::Command;
 use crate::i18n::tr;
 use crate::paths;
 use crate::ui::Window;
-use nolurix_config::link;
 use nolurix_config::profile::Group;
+use nolurix_config::subscription;
 
-/// One window for both adding methods: paste links or subscribe.
+/// One window for adding servers from links, JSON, or a subscription.
 /// They are separated by headings rather than tabs; the choice is obvious from
 /// what the user has in the clipboard.
 pub fn add_dialog(window: &Rc<Window>) {
@@ -29,10 +29,10 @@ pub fn add_dialog(window: &Rc<Window>) {
 
     // ── links ──────────────────────────────────────────────────────────
     let links_group = adw::PreferencesGroup::builder()
-        .title(tr("Вставить ссылки", "Paste links"))
+        .title(tr("Вставить ссылки или JSON", "Paste links or JSON"))
         .description(tr(
-            "По одной в строке: vless://, vmess://, trojan://, ss://, hysteria2://, tuic://",
-            "One per line: vless://, vmess://, trojan://, ss://, hysteria2://, tuic://",
+            "Ссылки по одной в строке или JSON-конфигурация sing-box / Xray",
+            "One link per line, or a sing-box / Xray JSON configuration",
         ))
         .build();
 
@@ -53,19 +53,25 @@ pub fn add_dialog(window: &Rc<Window>) {
 
     let add_links = gtk::Button::builder()
         .label(tr("Добавить", "Add"))
-        .halign(gtk::Align::End)
-        .margin_top(8)
         .css_classes(["suggested-action"])
         .build();
-    links_group.add(&add_links);
+    let open_json = gtk::Button::with_label(tr("Открыть JSON…", "Open JSON…"));
+    let buttons = gtk::Box::builder()
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .margin_top(8)
+        .build();
+    buttons.append(&open_json);
+    buttons.append(&add_links);
+    links_group.add(&buttons);
     page.add(&links_group);
 
     // ── subscription ────────────────────────────────────────────────────────
     let sub_group = adw::PreferencesGroup::builder()
         .title(tr("Подписка", "Subscription"))
         .description(tr(
-            "Ссылка на список серверов; обновляется по кнопке в списке",
-            "A server list URL; update it using the refresh button",
+            "Ссылка на список серверов. Автообновление включается в настройках.",
+            "A server list URL. Enable automatic updates in Settings.",
         ))
         .build();
 
@@ -91,6 +97,51 @@ pub fn add_dialog(window: &Rc<Window>) {
     toolbar.add_top_bar(&header);
     dialog.set_child(Some(&toolbar));
 
+    open_json.connect_clicked({
+        let window = window.clone();
+        let view = view.clone();
+        move |_| {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("JSON"));
+            filter.add_suffix("json");
+            let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            let picker = gtk::FileDialog::builder()
+                .title(tr("Открыть JSON", "Open JSON"))
+                .filters(&filters)
+                .build();
+            let buffer = view.buffer();
+            let window = window.clone();
+            picker.open(
+                Some(&window.root.clone()),
+                gtk::gio::Cancellable::NONE,
+                move |result| {
+                    let file = match result {
+                        Ok(file) => file,
+                        Err(error) if error.matches(gtk::DialogError::Dismissed) => return,
+                        Err(error) => {
+                            window.toast(&error.to_string());
+                            return;
+                        }
+                    };
+                    file.load_contents_async(
+                        gtk::gio::Cancellable::NONE,
+                        move |result| match result {
+                            Ok((bytes, _)) => match std::str::from_utf8(&bytes) {
+                                Ok(text) => buffer.set_text(text),
+                                Err(_) => window.toast(tr(
+                                    "JSON должен быть в кодировке UTF-8",
+                                    "JSON must use UTF-8 encoding",
+                                )),
+                            },
+                            Err(error) => window.toast(&error.to_string()),
+                        },
+                    );
+                },
+            );
+        }
+    });
+
     add_links.connect_clicked({
         let window = window.clone();
         let dialog = dialog.clone();
@@ -100,15 +151,25 @@ pub fn add_dialog(window: &Rc<Window>) {
             let text = buffer
                 .text(&buffer.start_iter(), &buffer.end_iter(), false)
                 .to_string();
-            let (profiles, errors) = link::parse_many(&text);
+            let parsed = match subscription::parse(&text) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let first = error.to_string();
+                    window.toast(&crate::tr_format!(
+                        "Не разобрать: {first}",
+                        "Could not parse: {first}"
+                    ));
+                    return;
+                }
+            };
+            let profiles = parsed.profiles;
+            let errors = parsed.errors;
             if profiles.is_empty() {
                 window.toast(&match errors.first() {
                     Some(first) => {
                         crate::tr_format!("Не разобрать: {first}", "Could not parse: {first}")
                     }
-                    None => {
-                        tr("Вставьте хотя бы одну ссылку", "Paste at least one link").to_string()
-                    }
+                    None => tr("Вставьте ссылку или JSON", "Paste a link or JSON").to_string(),
                 });
                 return;
             }
@@ -147,41 +208,36 @@ pub fn add_dialog(window: &Rc<Window>) {
                 window.toast(tr("Укажите адрес подписки", "Enter a subscription URL"));
                 return;
             }
+            if window.subscription_updating() {
+                window.toast(tr(
+                    "Другая подписка уже обновляется",
+                    "A subscription is already updating",
+                ));
+                return;
+            }
             let name = match name_row.text().trim() {
                 "" => host_of(&url),
                 name => name.to_string(),
             };
 
-            let gid = {
-                let store = window.state().store.borrow();
-                store.insert_group(&Group {
-                    name,
-                    url: url.clone(),
-                    ..Default::default()
-                })
+            let mut group = Group {
+                name,
+                url,
+                ..Default::default()
             };
+            let gid = window.state().store.borrow().insert_group(&group);
             let Ok(gid) = gid else {
                 window.toast(tr("Не удалось создать группу", "Could not create group"));
                 return;
             };
 
+            group.id = gid;
             window.state().current_gid.set(gid);
             window.servers_page().reload();
-            window.servers_page().set_updating(true);
-            window.state().engine.send(Command::FetchSubscription {
-                gid,
-                url,
-                user_agent: window.state().settings.borrow().sub_user_agent.clone(),
-                send_hwid: window.state().settings.borrow().sub_send_hwid,
-                custom_hwid_params: window
-                    .state()
-                    .settings
-                    .borrow()
-                    .sub_custom_hwid_params
-                    .clone(),
-            });
             dialog.close();
-            window.toast(tr("Загружаю подписку…", "Downloading subscription…"));
+            if window.fetch_subscription(group, true) {
+                window.toast(tr("Загружаю подписку…", "Downloading subscription…"));
+            }
         }
     });
 
@@ -200,20 +256,9 @@ pub fn update_subscription(window: &Rc<Window>) {
         ));
         return;
     }
-    window.servers_page().set_updating(true);
-    window.state().engine.send(Command::FetchSubscription {
-        gid,
-        url: group.url,
-        user_agent: window.state().settings.borrow().sub_user_agent.clone(),
-        send_hwid: window.state().settings.borrow().sub_send_hwid,
-        custom_hwid_params: window
-            .state()
-            .settings
-            .borrow()
-            .sub_custom_hwid_params
-            .clone(),
-    });
-    window.toast(tr("Обновляю подписку…", "Updating subscription…"));
+    if window.fetch_subscription(group, true) {
+        window.toast(tr("Обновляю подписку…", "Updating subscription…"));
+    }
 }
 
 /// Import data from the original Throne. Import adds groups rather than replacing

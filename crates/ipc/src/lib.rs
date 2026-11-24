@@ -57,6 +57,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latency_reports_before_slow_batch_and_deduplicates_final() {
+        async fn respond(peer: &mut UnixStream, id: u32, response: impl Message) {
+            let bytes = response.encode_to_vec();
+            peer.write_u32_le(id).await.unwrap();
+            peer.write_u8(0).await.unwrap();
+            peer.write_u32_le(bytes.len() as u32).await.unwrap();
+            peer.write_all(&bytes).await.unwrap();
+        }
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let client = CoreClient::attach(stream);
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = tokio::spawn(async move {
+            client
+                .test_incremental(pb::TestReq::default(), |result| {
+                    let tx = tx.clone();
+                    async move { tx.send(result).await.map_err(Into::into) }
+                })
+                .await
+        });
+        let test_id = request(&mut peer).await;
+        let query_id = request(&mut peer).await;
+        let fast = pb::UrlTestResp {
+            outbound_tag: Some("fast".into()),
+            latency_ms: Some(12),
+            ..Default::default()
+        };
+        respond(
+            &mut peer,
+            query_id,
+            pb::QueryUrlTestResponse {
+                results: vec![fast.clone()],
+            },
+        )
+        .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .outbound_tag(),
+            "fast"
+        );
+        assert!(
+            !task.is_finished(),
+            "early result must precede batch completion"
+        );
+        let slow = pb::UrlTestResp {
+            outbound_tag: Some("slow".into()),
+            latency_ms: Some(900),
+            ..Default::default()
+        };
+        respond(
+            &mut peer,
+            test_id,
+            pb::TestResp {
+                results: vec![fast, slow],
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap().outbound_tag(), "slow");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn disconnect_fails_pending_and_future() {
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let client = CoreClient::attach(stream);
@@ -929,6 +998,45 @@ impl CoreClient {
     pub async fn test(&self, req: pb::TestReq) -> Result<pb::TestResp> {
         let budget = latency_budget(&req);
         self.call_with_timeout("Test", req, budget).await
+    }
+
+    /// Drain the core's per-probe reporter while Test is still running.
+    /// The terminal response remains the authoritative fallback for probes that
+    /// complete between the last query and the core reclaiming its reporter.
+    /// Use on a measurement-owned client: the reporter is scoped to the core.
+    pub async fn test_incremental<F, Fut>(&self, req: pb::TestReq, mut emit: F) -> Result<()>
+    where
+        F: FnMut(pb::UrlTestResp) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let test = self.test(req);
+        tokio::pin!(test);
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let (results, finished) = tokio::select! {
+                biased;
+                response = &mut test => (response?.results, true),
+                _ = tick.tick() => {
+                    // Keep polling Test during a query: otherwise its submission
+                    // can be delayed and a completed response cannot win.
+                    tokio::select! {
+                        biased;
+                        response = &mut test => (response?.results, true),
+                        response = self.query_url_test() => (response?.results, false),
+                    }
+                }
+            };
+            for result in results {
+                if seen.insert(result.outbound_tag().to_owned()) {
+                    emit(result).await?;
+                }
+            }
+            if finished {
+                return Ok(());
+            }
+        }
     }
 
     pub async fn stop_test(&self) -> Result<()> {

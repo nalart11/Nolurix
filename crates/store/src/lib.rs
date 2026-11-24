@@ -4,6 +4,7 @@
 //! original Throne: two programs writing to one file will eventually overwrite
 //! each other's changes. Data from Throne is moved by a one-time import — see [`Store::import_throne`].
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -14,6 +15,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
 pub mod migration;
+pub mod subscription;
 
 pub struct Store {
     conn: Connection,
@@ -309,40 +311,84 @@ impl Store {
         gid: i64,
         incoming: &[Profile],
     ) -> Result<(usize, usize, usize)> {
+        self.reconcile_group_profiles(gid, incoming, None)
+    }
+
+    /// Applies the result of a fetch only if the group still has the same URL.
+    /// A failed or empty fetch must not wipe the last known good server list.
+    pub fn apply_subscription(
+        &mut self,
+        gid: i64,
+        url: &str,
+        parsed: &nolurix_config::subscription::Parsed,
+        now: i64,
+    ) -> Result<(usize, usize, usize)> {
+        anyhow::ensure!(
+            !parsed.profiles.is_empty(),
+            "{}",
+            if parsed.errors.is_empty() {
+                "Subscription contains no supported servers".to_string()
+            } else {
+                parsed.errors.join("; ")
+            },
+        );
+        self.reconcile_group_profiles(gid, &parsed.profiles, Some((url, &parsed.info, now)))
+    }
+
+    fn reconcile_group_profiles(
+        &mut self,
+        gid: i64,
+        incoming: &[Profile],
+        subscription: Option<(&str, &str, i64)>,
+    ) -> Result<(usize, usize, usize)> {
         let existing = self.profiles(Some(gid))?;
+        let mut by_fingerprint: HashMap<_, VecDeque<_>> = HashMap::new();
+        for old in &existing {
+            by_fingerprint
+                .entry(fingerprint(old))
+                .or_default()
+                .push_back(old.id);
+        }
         let mut kept = 0usize;
 
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM profiles WHERE gid = ?1", [gid])?;
+        if let Some((url, info, now)) = subscription {
+            let updated = tx.execute(
+                "UPDATE groups SET info = ?3, sub_last_update = ?4,
+                                   updated_at = strftime('%s','now')
+                 WHERE id = ?1 AND url = ?2 AND url != ''",
+                params![gid, url, info, now],
+            )?;
+            anyhow::ensure!(updated == 1, "Subscription was removed or its URL changed");
+        }
 
         for (order, profile) in incoming.iter().enumerate() {
-            let previous = existing
-                .iter()
-                .find(|old| fingerprint(old) == fingerprint(profile));
-            if previous.is_some() {
+            let previous = by_fingerprint
+                .get_mut(&fingerprint(profile))
+                .and_then(VecDeque::pop_front);
+            let outbound = profile.outbound.to_string();
+            if let Some(id) = previous {
+                // Retain identity as well as history: selection, live traffic,
+                // and in-flight measurement results all refer to this ID.
+                tx.execute(
+                    "UPDATE profiles SET type = ?2, name = ?3, outbound_json = ?4,
+                                         display_order = ?5, updated_at = strftime('%s','now')
+                     WHERE id = ?1",
+                    params![id, profile.kind, profile.name, outbound, order as i64],
+                )?;
                 kept += 1;
+            } else {
+                tx.execute(
+                    "INSERT INTO profiles (type, name, gid, outbound_json, display_order)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![profile.kind, profile.name, gid, outbound, order as i64],
+                )?;
             }
-            tx.execute(
-                "INSERT INTO profiles (type, name, gid, outbound_json, latency, dl_speed, ul_speed,
-                                       test_country, ip_out, traffic_dl, traffic_up, latency_at,
-                                       display_order)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    profile.kind,
-                    profile.name,
-                    gid,
-                    profile.outbound.to_string(),
-                    previous.map_or(0, |p| p.latency),
-                    previous.map_or(String::new(), |p| p.dl_speed.clone()),
-                    previous.map_or(String::new(), |p| p.ul_speed.clone()),
-                    previous.map_or(String::new(), |p| p.test_country.clone()),
-                    previous.map_or(String::new(), |p| p.ip_out.clone()),
-                    previous.map_or(0, |p| p.traffic_dl),
-                    previous.map_or(0, |p| p.traffic_up),
-                    previous.map_or(0, |p| p.latency_at),
-                    order as i64,
-                ],
-            )?;
+        }
+        // Insert first so SQLite cannot reuse removed IDs for new servers in
+        // this refresh, even when the removed ID was the current maximum.
+        for id in by_fingerprint.into_values().flatten() {
+            tx.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
         }
         tx.commit()?;
 
@@ -737,6 +783,7 @@ fn fingerprint(profile: &Profile) -> String {
     if let Some(obj) = copy.as_object_mut() {
         obj.remove("tag");
     }
+    copy.sort_all_objects();
     copy.to_string()
 }
 
@@ -864,6 +911,7 @@ mod tests {
         let profiles = store.profiles(Some(gid)).unwrap();
         assert_eq!(profiles.len(), 2);
         let same = profiles.iter().find(|p| p.name == "новое имя").unwrap();
+        assert_eq!(same.id, id, "selection and active tests use the profile ID");
         assert_eq!(same.latency, 42, "задержка должна пережить обновление");
         assert_eq!(same.traffic_dl, 1000);
         let fresh = profiles.iter().find(|p| p.name == "второй").unwrap();
@@ -884,6 +932,50 @@ mod tests {
         let (added, kept, removed) = store.replace_group_profiles(1, &incoming).unwrap();
         assert_eq!((added, kept, removed), (0, 1, 1));
         assert_eq!(store.profiles(Some(1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn subscription_refresh_rejects_stale_and_empty_fetches_and_retains_identity() {
+        use nolurix_config::subscription::Parsed;
+
+        let mut store = Store::open_memory().unwrap();
+        let url = "http://example.test/current";
+        let gid = store
+            .insert_group(&Group {
+                url: url.into(),
+                ..Group::default()
+            })
+            .unwrap();
+        let mut old = profile("trojan://pw@a.example:443#old");
+        old.gid = gid;
+        let id = store.insert_profile(&old).unwrap();
+        let mut removed = profile("trojan://pw@b.example:443#removed");
+        removed.gid = gid;
+        let removed_id = store.insert_profile(&removed).unwrap();
+        let parsed = Parsed {
+            profiles: vec![
+                profile("trojan://pw@a.example:443#new"),
+                profile("trojan://pw@a.example:443#duplicate"),
+            ],
+            info: "quota".into(),
+            ..Parsed::default()
+        };
+        assert!(store
+            .apply_subscription(gid, "http://example.test/old", &parsed, 42)
+            .is_err());
+        assert!(store
+            .apply_subscription(gid, url, &Parsed::default(), 42)
+            .is_err());
+        assert_eq!(store.group(gid).unwrap().unwrap().sub_last_update, 0);
+        assert_eq!(store.profiles(Some(gid)).unwrap().len(), 2);
+        assert_eq!(
+            store.apply_subscription(gid, url, &parsed, 42).unwrap(),
+            (1, 1, 1)
+        );
+        assert_eq!(store.profile(id).unwrap().unwrap().name, "new");
+        assert!(store.profile(removed_id).unwrap().is_none());
+        let group = store.group(gid).unwrap().unwrap();
+        assert_eq!((group.sub_last_update, group.info.as_str()), (42, "quota"));
     }
 
     #[test]

@@ -170,16 +170,15 @@ fn device_model() -> String {
 
 /// Parses a subscription body in any known format.
 pub fn parse(body: &str) -> Result<Parsed> {
-    let text = body.trim();
+    let text = body.trim().trim_start_matches('\u{feff}').trim();
     if text.is_empty() {
         bail!("подписка пуста");
     }
 
     // JSON: either an array of outbounds or a complete sing-box configuration.
     if text.starts_with('{') || text.starts_with('[') {
-        if let Ok(v) = serde_json::from_str::<Value>(text) {
-            return Ok(parse_json(&v));
-        }
+        let v = serde_json::from_str::<Value>(text).context("разбор JSON")?;
+        return parse_json(&v);
     }
 
     // Clash: look for a top-level key rather than merely a colon;
@@ -192,7 +191,11 @@ pub fn parse(body: &str) -> Result<Parsed> {
 
     // Link list: plain or base64-encoded.
     if let Some(decoded) = try_decode_body(text) {
-        let (profiles, errors) = link::parse_many(&decoded);
+        let decoded = decoded.trim().trim_start_matches('\u{feff}').trim();
+        if decoded.starts_with('{') || decoded.starts_with('[') {
+            return parse(decoded);
+        }
+        let (profiles, errors) = link::parse_many(decoded);
         if !profiles.is_empty() {
             return Ok(Parsed {
                 profiles,
@@ -230,33 +233,122 @@ fn try_decode_body(text: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
-fn parse_json(v: &Value) -> Parsed {
-    let outbounds = match v {
-        Value::Array(a) => a.clone(),
-        Value::Object(o) => o
-            .get("outbounds")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    };
-
+fn parse_json(v: &Value) -> Result<Parsed> {
     let mut out = Parsed::default();
-    for ob in outbounds {
-        // Service outbounds in a configuration are not servers.
-        let kind = ob.get("type").and_then(Value::as_str).unwrap_or("");
-        if matches!(
-            kind,
-            "direct" | "block" | "dns" | "selector" | "urltest" | ""
-        ) {
-            continue;
-        }
-        match Profile::from_outbound(ob) {
-            Ok(p) => out.profiles.push(p),
-            Err(e) => out.errors.push(e.to_string()),
+    for (index, entry) in v
+        .as_array()
+        .map_or(std::slice::from_ref(v), Vec::as_slice)
+        .iter()
+        .enumerate()
+    {
+        let location = if v.is_array() {
+            format!("JSON[{}]", index + 1)
+        } else {
+            "JSON".to_string()
+        };
+        // A selector/urltest also has an `outbounds` field but is not a config.
+        if let Some(outbounds) = entry
+            .get("outbounds")
+            .filter(|_| entry.get("type").is_none() && entry.get("protocol").is_none())
+        {
+            let Some(outbounds) = outbounds.as_array() else {
+                out.errors
+                    .push(format!("{location}: `outbounds` должен быть массивом"));
+                continue;
+            };
+            let remarks = entry
+                .get("remarks")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let before = (out.profiles.len(), out.errors.len());
+            for (i, ob) in outbounds.iter().enumerate() {
+                push_json_outbound(
+                    &mut out,
+                    ob,
+                    remarks,
+                    &format!("{location}.outbounds[{}]", i + 1),
+                );
+            }
+            if before == (out.profiles.len(), out.errors.len()) {
+                out.errors
+                    .push(format!("{location}: `outbounds` не содержит серверов"));
+            }
+        } else {
+            push_json_outbound(&mut out, entry, "", &location);
         }
     }
-    out
+    if out.profiles.is_empty() {
+        bail!(
+            "JSON: нет серверов для импорта{}",
+            if out.errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", out.errors.join("; "))
+            }
+        );
+    }
+    Ok(out)
+}
+
+fn push_json_outbound(out: &mut Parsed, ob: &Value, remarks: &str, location: &str) {
+    match json_outbound(ob) {
+        Ok(Some(mut profile)) => {
+            if !remarks.is_empty()
+                && (profile.name.trim().is_empty()
+                    || profile.name.trim().eq_ignore_ascii_case("proxy"))
+            {
+                profile.name = remarks.to_string();
+            }
+            out.profiles.push(profile);
+        }
+        Ok(None) => {}
+        Err(e) => out.errors.push(format!("{location}: {e}")),
+    }
+}
+
+fn json_outbound(ob: &Value) -> Result<Option<Profile>> {
+    let obj = ob
+        .as_object()
+        .context("outbound должен быть JSON-объектом")?;
+    let is_xray = match (obj.get("type"), obj.get("protocol")) {
+        (Some(Value::String(kind)), None) if !kind.trim().is_empty() => {
+            if matches!(
+                kind.as_str(),
+                "direct" | "block" | "dns" | "selector" | "urltest"
+            ) {
+                return Ok(None);
+            }
+            false
+        }
+        (None, Some(Value::String(protocol))) if !protocol.trim().is_empty() => {
+            if matches!(
+                protocol.as_str(),
+                "freedom" | "blackhole" | "dns" | "loopback"
+            ) {
+                return Ok(None);
+            }
+            true
+        }
+        _ => bail!(
+            "outbound должен содержать ровно одно непустое строковое поле: `type` или `protocol`"
+        ),
+    };
+    if is_xray {
+        for field in ["settings", "streamSettings"] {
+            if obj.get(field).is_some_and(|value| !value.is_object()) {
+                bail!("`{field}` должен быть JSON-объектом");
+            }
+        }
+    }
+    // Only the outbound is retained, not routing or other tagged dependencies.
+    if obj.contains_key("detour")
+        || obj.contains_key("proxySettings")
+        || ob.pointer("/streamSettings/sockopt/dialerProxy").is_some()
+    {
+        bail!("зависимые outbound не поддерживаются");
+    }
+    Profile::from_outbound(ob.clone()).map(Some)
 }
 
 /// Clash configuration. Convert each `proxies[]` entry to a link and pass it to the shared parser:
@@ -577,6 +669,115 @@ mod tests {
     fn plain_list_is_accepted() {
         let parsed = parse("trojan://pw@a.example:443#a\n").unwrap();
         assert_eq!(parsed.profiles.len(), 1);
+    }
+
+    #[test]
+    fn standalone_and_base64_json_are_accepted() {
+        let body = r#"{"type":"trojan","tag":"one","server":"a.example","server_port":443,"password":"pw"}"#;
+        for input in [
+            body.to_string(),
+            STANDARD.encode(body),
+            format!("\u{feff}{body}"),
+        ] {
+            let parsed = parse(&input).unwrap();
+            assert_eq!(parsed.profiles.len(), 1);
+            assert_eq!(parsed.profiles[0].name, "one");
+        }
+        assert_eq!(parse(&format!("[{body}]")).unwrap().profiles.len(), 1);
+    }
+
+    #[test]
+    fn xray_json_preserves_native_settings() {
+        let ob = serde_json::json!({
+            "protocol": "vless", "tag": "native",
+            "settings": {"vnext": [{"address": "a.example", "port": 443,
+                "users": [{"id": "uuid", "encryption": "none"}]}]},
+            "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/test"}}
+        });
+        for body in [
+            ob.to_string(),
+            serde_json::json!({"outbounds": [
+                {"protocol": "freedom", "tag": "direct"}, ob.clone(),
+                {"protocol": "blackhole", "tag": "block"}
+            ]})
+            .to_string(),
+        ] {
+            let parsed = parse(&body).unwrap();
+            assert_eq!(parsed.profiles.len(), 1);
+            assert_eq!(parsed.profiles[0].outbound, ob);
+            assert_eq!(parsed.profiles[0].kind, "xrayvless");
+        }
+    }
+
+    #[test]
+    fn json_errors_are_not_silently_ignored() {
+        for body in [
+            "{broken",
+            "[]",
+            "{}",
+            r#"{"outbounds":{}}"#,
+            r#"{"outbounds":[{"type":"direct"}]}"#,
+            r#"{"protocol":"vless","proxySettings":{"tag":"other"}}"#,
+            r#"{"type":"vless","protocol":"vless"}"#,
+        ] {
+            assert!(parse(body).is_err(), "accepted {body}");
+            assert!(
+                parse(&STANDARD.encode(body)).is_err(),
+                "accepted encoded {body}"
+            );
+        }
+        let parsed = parse(
+            r#"[null,{"type":"trojan","server":"a.example","server_port":443,"password":"pw"}]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.profiles.len(), 1);
+        assert_eq!(parsed.errors.len(), 1);
+    }
+
+    #[test]
+    fn json_config_array_uses_remarks_for_generic_or_missing_tags() {
+        let xray = serde_json::json!({"protocol":"vless","tag":"proxy",
+            "settings":{"address":"a.example","port":443,"id":"id"}});
+        let singbox = serde_json::json!({"type":"trojan","server":"b.example",
+            "server_port":443,"password":"pw"});
+        let body = serde_json::json!([
+            {"remarks":" Alpha ","outbounds":[xray.clone(), {"protocol":"freedom"}]},
+            {"remarks":"Beta","outbounds":[singbox.clone(),
+                {"type":"trojan","tag":"Custom","server":"c.example","server_port":443,"password":"pw"},
+                {"type":"selector","outbounds":["Custom"]}]},
+            {"remarks":"Broken","outbounds":[{"outbounds":[xray.clone()]}]},
+            {"outbounds":{}}
+        ]);
+        for input in [body.to_string(), STANDARD.encode(body.to_string())] {
+            let parsed = parse(&input).unwrap();
+            let labels: Vec<_> = parsed.profiles.iter().map(|p| p.name.as_str()).collect();
+            assert_eq!(labels, ["Alpha", "Beta", "Custom"]);
+            assert_eq!(parsed.profiles[0].outbound, xray);
+            assert_eq!(parsed.profiles[1].outbound, singbox);
+            assert_eq!(parsed.errors.len(), 2);
+            assert!(parsed.errors[0].contains("JSON[3].outbounds[1]"));
+            assert!(parsed.errors[1].contains("JSON[4]"));
+        }
+    }
+
+    #[test]
+    fn json_outbound_requires_unambiguous_shape_not_a_protocol_allowlist() {
+        for body in [
+            r#"{"type":"","protocol":"vless"}"#,
+            r#"{"protocol":"vless","settings":[]}"#,
+            r#"[[{"type":"trojan"}]]"#,
+        ] {
+            assert!(parse(body).is_err(), "accepted {body}");
+        }
+        let parsed = parse(r#"{"protocol":"future-protocol","settings":{}}"#).unwrap();
+        assert_eq!(parsed.profiles[0].kind, "xrayfuture-protocol");
+    }
+
+    #[test]
+    fn mixed_link_list_keeps_successes_and_errors() {
+        let parsed = parse("trojan://pw@a.example:443#a\nnot-a-link").unwrap();
+        assert_eq!(parsed.profiles.len(), 1);
+        assert_eq!(parsed.errors.len(), 1);
     }
 
     #[test]

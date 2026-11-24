@@ -196,14 +196,14 @@ struct SettingsView: View {
 
     private var subscriptionSection: some View {
         Section(tr("Подписки", "Subscriptions")) {
-            Toggle(tr("Сохранять предпочтение автообновления", "Store auto-update preference"), isOn: boolBinding("sub_auto_update"))
+            Toggle(tr("Автоматически обновлять подписки", "Automatically refresh subscriptions"), isOn: boolBinding("sub_auto_update"))
             Text(tr(
-                "Сейчас это только сохранённое предпочтение: планировщик автоматического обновления ещё не подключён. Подписку можно обновить вручную в списке групп.",
-                "This is a stored preference only: automatic subscription scheduling is not implemented yet. Refresh a subscription manually from the group list."
+                "Подписки обновляются, пока Nolurix запущен, даже если окно скрыто. Обновление группы, к которой вы подключены, ждёт отключения.",
+                "Subscriptions refresh while Nolurix is running, even when the window is hidden. The connected group refreshes after you disconnect."
             ))
             .font(.caption)
             .foregroundStyle(.secondary)
-            numberField("sub_auto_update_minutes", title: tr("Интервал предпочтения (мин)", "Preferred interval (min)"), range: 10...10080)
+            numberField("sub_auto_update_minutes", title: tr("Интервал обновления (мин)", "Refresh interval (min)"), range: 10...10080)
             textField("sub_user_agent", title: "User-Agent")
             Toggle(tr("Отправлять HWID при обновлении", "Send HWID when refreshing"), isOn: boolBinding("sub_send_hwid"))
             textField("sub_custom_hwid_params", title: tr("Параметры HWID", "HWID parameters"))

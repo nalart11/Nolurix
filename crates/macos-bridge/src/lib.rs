@@ -13,10 +13,10 @@ mod paths;
 use anyhow::{anyhow, bail, Context, Result};
 use engine::{Command, Engine, Event, Status};
 use nolurix_config::{profile::Group, Profile, Settings};
-use nolurix_store::Store;
+use nolurix_store::{subscription::RefreshSchedule, Store};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, CString},
     path::PathBuf,
     sync::{mpsc, Mutex, OnceLock},
@@ -24,6 +24,7 @@ use std::{
 };
 
 const INPUT_CAP: usize = 4 * 1024 * 1024;
+const REFRESH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 type Reply = mpsc::Sender<Result<Value>>;
 enum Message {
     Request(Value, Reply),
@@ -292,6 +293,12 @@ fn open(options: Value) -> Result<Value> {
     reg.workers.insert(h, Some(tx));
     Ok(json!(h))
 }
+struct PendingSubscription {
+    gid: i64,
+    url: String,
+    manual: bool,
+}
+
 struct State {
     runtime: tempfile::TempDir,
     log_events: async_channel::Receiver<Event>,
@@ -308,11 +315,15 @@ struct State {
     auto: Value,
     testing: bool,
     speed: String,
+    // Pending profiles only: removing an ID makes the result count monotonic.
     latency: HashMap<i64, String>,
+    latency_total: usize,
     latency_error: Option<String>,
     speed_profile: Option<(i64, String)>,
     checking: bool,
-    subscription: Option<i64>,
+    subscription: Option<PendingSubscription>,
+    refresh_schedule: RefreshSchedule,
+    next_refresh_check: Instant,
     notice: Option<String>,
     changed: bool,
 }
@@ -337,6 +348,7 @@ impl State {
     fn new(dir: PathBuf, core: PathBuf) -> Result<Self> {
         let store = Store::open(&dir.join("nolurix.db"))?;
         let mut settings = store.settings()?;
+        let refresh_schedule = RefreshSchedule::on_startup(&store.groups()?, &settings);
         settings.cache_file = dir.join("cache.db").to_string_lossy().into_owned();
         LOCALE.get_or_init(|| i18n::init(settings.language));
         let (tx, events) = async_channel::bounded(256);
@@ -372,10 +384,14 @@ impl State {
             testing: false,
             speed: String::new(),
             latency: HashMap::new(),
+            latency_total: 0,
             latency_error: None,
             speed_profile: None,
             checking: false,
             subscription: None,
+            refresh_schedule,
+            // Give connect-on-launch and initial user commands first use of the bridge.
+            next_refresh_check: Instant::now() + REFRESH_CHECK_INTERVAL,
             notice: None,
             changed: true,
         })
@@ -404,6 +420,90 @@ impl State {
                 Err(_) => break,
             }
         }
+        if self.check_subscription_schedule().is_err() {
+            // Fetch errors may contain private subscription URLs. Keep them out of
+            // automatic notices and logs.
+            tracing::debug!("could not start a scheduled subscription refresh");
+        }
+    }
+    fn check_subscription_schedule(&mut self) -> Result<()> {
+        let instant = Instant::now();
+        if self.closing
+            || !self.settings.sub_auto_update
+            || self.testing
+            || self.speed_profile.is_some()
+            || self.checking
+            || self.subscription.is_some()
+            || matches!(self.status, Status::Connecting)
+            || instant < self.next_refresh_check
+        {
+            return Ok(());
+        }
+        self.next_refresh_check = instant + REFRESH_CHECK_INTERVAL;
+        let active_gid = match self.status {
+            Status::Connected { profile_id, .. } if profile_id < 0 => profile_id.checked_neg(),
+            Status::Connected { profile_id, .. } => self.store.profile(profile_id)?.map(|p| p.gid),
+            _ => None,
+        };
+        let mut groups = self.store.groups()?;
+        groups.retain(|g| Some(g.id) != active_gid);
+        let timestamp = now();
+        if let Some(g) = self
+            .refresh_schedule
+            .due(&groups, &self.settings, timestamp)
+            .and_then(|gid| groups.into_iter().find(|g| g.id == gid))
+        {
+            self.start_subscription(g, false, timestamp)?;
+            self.changed = true;
+        }
+        Ok(())
+    }
+    fn start_subscription(&mut self, group: Group, manual: bool, timestamp: i64) -> Result<()> {
+        if group.url.trim().is_empty() {
+            bail!("group has no subscription URL");
+        }
+        self.engine.try_send(Command::FetchSubscription {
+            gid: group.id,
+            url: group.url.clone(),
+            user_agent: self.settings.sub_user_agent.clone(),
+            send_hwid: self.settings.sub_send_hwid,
+            custom_hwid_params: self.settings.sub_custom_hwid_params.clone(),
+        })?;
+        self.refresh_schedule.record_attempt(group.id, timestamp);
+        self.subscription = Some(PendingSubscription {
+            gid: group.id,
+            url: group.url,
+            manual,
+        });
+        Ok(())
+    }
+    fn apply_subscription_result(
+        &mut self,
+        pending: PendingSubscription,
+        result: std::result::Result<nolurix_config::subscription::Parsed, String>,
+    ) -> Result<()> {
+        let parsed = result.map_err(|e| anyhow!(e))?;
+        let selected_in_group = self.selected > 0
+            && self
+                .store
+                .profile(self.selected)?
+                .is_some_and(|p| p.gid == pending.gid);
+        let (added, kept, removed) =
+            self.store
+                .apply_subscription(pending.gid, &pending.url, &parsed, now())?;
+        if selected_in_group && self.store.profile(self.selected)?.is_none() {
+            self.clear_selection()?;
+        }
+        if pending.manual {
+            let label = self.localized("Подписка", "Subscription");
+            let warnings = if parsed.errors.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", parsed.errors.join("; "))
+            };
+            self.notice = Some(format!("{label}: +{added}, ={kept}, −{removed}{warnings}"));
+        }
+        Ok(())
     }
     fn reduce_report(&mut self, e: Event) {
         if let Err(e) = self.reduce(e) {
@@ -435,9 +535,28 @@ impl State {
             }
             Status::Failed(e) => json!({"kind":"failed","error":e}),
         };
-        Ok(
-            json!({"groups":self.store.groups()?.into_iter().map(GroupWire).collect::<Vec<_>>(),"profiles":self.store.profiles(None)?.into_iter().map(ProfileWire).collect::<Vec<_>>(),"settings":self.settings,"status":status,"selected_id":self.selected,"logs":self.logs,"connections":self.connections,"traffic":{"down":self.traffic[0],"up":self.traffic[1],"total_down":self.traffic[2],"total_up":self.traffic[3]},"auto_status":self.auto,"testing":self.testing,"speed_stage":self.speed,"notice":self.notice}),
-        )
+        let latency_progress = self.testing.then(|| {
+            json!({"completed": self.latency_total - self.latency.len(), "total": self.latency_total})
+        });
+        Ok(json!({
+            "groups": self.store.groups()?.into_iter().map(GroupWire).collect::<Vec<_>>(),
+            "profiles": self.store.profiles(None)?.into_iter().map(ProfileWire).collect::<Vec<_>>(),
+            "settings": self.settings,
+            "status": status,
+            "selected_id": self.selected,
+            "logs": self.logs,
+            "connections": self.connections,
+            "traffic": {
+                "down": self.traffic[0], "up": self.traffic[1],
+                "total_down": self.traffic[2], "total_up": self.traffic[3]
+            },
+            "auto_status": self.auto,
+            "testing": self.testing,
+            "latency_progress": latency_progress,
+            "speed_stage": self.speed,
+            "subscription_refresh_gid": self.subscription.as_ref().map(|job| job.gid),
+            "notice": self.notice,
+        }))
     }
     fn request(&mut self, v: Value) -> Result<Value> {
         let op = v.get("op").and_then(Value::as_str).context("missing op")?;
@@ -604,6 +723,7 @@ impl State {
                     bail!("subscription refresh in progress");
                 }
                 let settings = Box::new(self.settings.clone());
+                let mut pending_latency = HashMap::new();
                 let command = match op {
                     "test_latency" => {
                         let mut ids = ids(&v)?;
@@ -615,11 +735,16 @@ impl State {
                                 .map(|p| p.id)
                                 .collect();
                         }
+                        let mut seen = HashSet::new();
+                        ids.retain(|id| seen.insert(*id));
+                        if ids.is_empty() {
+                            bail!("group has no profiles to test");
+                        }
                         let profiles = ids
                             .iter()
                             .map(|&n| self.profile(n))
                             .collect::<Result<Vec<_>>>()?;
-                        self.latency = profiles.iter().map(|p| (p.id, fingerprint(p))).collect();
+                        pending_latency = profiles.iter().map(|p| (p.id, fingerprint(p))).collect();
                         Command::TestLatency {
                             profiles,
                             ids,
@@ -640,6 +765,8 @@ impl State {
                 match op {
                     "test_latency" => {
                         self.testing = true;
+                        self.latency_total = pending_latency.len();
+                        self.latency = pending_latency;
                         self.latency_error = None;
                     }
                     "speed_test" => {
@@ -654,19 +781,17 @@ impl State {
                 self.engine.try_send(Command::StopTest)?;
             }
             "subscription_refresh" => {
-                self.mutable()?;
-                let g = self.store.group(gid()?)?.context("group not found")?;
-                if g.url.is_empty() {
-                    bail!("group has no subscription URL");
+                let gid = gid()?;
+                if let Some(pending) = &mut self.subscription {
+                    if pending.gid == gid && !pending.manual {
+                        // A manual request can join the already-running job.
+                        pending.manual = true;
+                        return Ok(Value::Null);
+                    }
                 }
-                self.engine.try_send(Command::FetchSubscription {
-                    gid: g.id,
-                    url: g.url,
-                    user_agent: self.settings.sub_user_agent.clone(),
-                    send_hwid: self.settings.sub_send_hwid,
-                    custom_hwid_params: self.settings.sub_custom_hwid_params.clone(),
-                })?;
-                self.subscription = Some(g.id);
+                self.mutable()?;
+                let group = self.store.group(gid)?.context("group not found")?;
+                self.start_subscription(group, true, now())?;
             }
             "auto_recheck" | "auto_pin" => {
                 if !matches!(self.status,Status::Connected{profile_id,..} if profile_id<0) {
@@ -696,12 +821,46 @@ impl State {
         Event::Traffic{down,up}=>{self.traffic[0]=down;self.traffic[1]=up;self.traffic[2]=self.traffic[2].saturating_add(down);self.traffic[3]=self.traffic[3].saturating_add(up);if let Status::Connected{profile_id,..}=self.status{if profile_id>0{self.store.add_traffic(profile_id,down,up)?;}}},
         Event::Connections(c)=>self.connections=Value::Array(c.into_iter().map(|c|json!({"id":c.id,"dest":c.dest,"domain":c.domain,"network":c.network,"process":c.process,"upload":c.upload,"download":c.download,"created_at":c.created_at})).collect()),
         Event::AutoStatus{selected,pinned,alive,total,suspended}=>self.auto=json!({"selected":selected,"pinned":pinned,"alive":alive,"total":total,"suspended":suspended}),
-        Event::LatencyResult{id,latency}=>{let p=self.profile(id)?;if !self.testing || self.latency.get(&id)!=Some(&fingerprint(&p)){bail!("stale latency result");}self.store.set_latency(id,latency,now())?;},
-        Event::TestFinished{tested}=>{if !self.testing{bail!("stale latency completion");}self.testing=false;self.latency.clear();let summary=match self.settings.language {nolurix_config::settings::Language::Ru=>format!("Проверено: {tested}"),_=>format!("Tested: {tested}")};self.notice=Some(match self.latency_error.take(){Some(error)=>format!("{summary}: {error}"),None=>summary});},
+         Event::LatencyResult { id, latency } => {
+             let p = self.profile(id)?;
+             if !self.testing || self.latency.get(&id) != Some(&fingerprint(&p)) {
+                 bail!("stale latency result");
+             }
+             self.store.set_latency(id, latency, now())?;
+             self.latency.remove(&id);
+         }
+         Event::TestFinished { tested } => {
+             if !self.testing {
+                 bail!("stale latency completion");
+             }
+             self.testing = false;
+             // The engine can report zero on cancellation even after sending results.
+             let completed = tested.max(self.latency_total - self.latency.len());
+             self.latency.clear();
+             self.latency_total = 0;
+             let label = self.localized("Проверено", "Tested");
+             let summary = format!("{label}: {completed}");
+             self.notice = Some(match self.latency_error.take() {
+                 Some(error) => format!("{summary}: {error}"),
+                 None => summary,
+             });
+         }
         Event::SpeedProgress{id,stage}=>{let p=self.profile(id)?;if self.speed_profile.as_ref()!=Some(&(id,fingerprint(&p))){bail!("stale speed progress");}self.speed=stage;},
         Event::SpeedResult{id,download,upload,country,latency,error}=>{let expected=self.speed_profile.take().context("stale speed completion")?;self.speed.clear();if expected.0!=id{self.speed_profile=Some(expected);bail!("stale speed profile ID");}if !error.is_empty(){bail!("{error}");}let p=self.profile(id)?;if fingerprint(&p)!=expected.1{bail!("stale speed result");}self.store.set_speed(id,&download,&upload,&country)?;if latency>0{self.store.set_latency(id,latency,now())?;}},
         Event::ConfigChecked(r)=>{if !self.checking{bail!("stale configuration completion");}self.checking=false;r.map_err(|e|anyhow!(e))?;self.notice=Some(self.localized("Конфигурация верна", "Configuration OK").into());},
-        Event::Subscription{gid,result}=>{if self.subscription!=Some(gid){bail!("stale subscription result");}self.subscription=None;let parsed=result.map_err(|e|anyhow!(e))?;if parsed.profiles.is_empty(){bail!("subscription contains no profiles: {}",parsed.errors.join("\n"));}let mut g=self.store.group(gid)?.context("group no longer exists")?;let counts=self.store.replace_group_profiles(gid,&parsed.profiles)?;g.info=parsed.info;g.sub_last_update=now();self.store.update_group(&g)?;self.clear_selection()?;self.notice=Some(format!("{}: +{}, ={}, −{}{}",self.localized("Подписка", "Subscription"),counts.0,counts.1,counts.2,if parsed.errors.is_empty(){String::new()}else{format!("; {}",parsed.errors.join("; "))}));},
+         Event::Subscription { gid, result } => {
+             if self.subscription.as_ref().map(|job| job.gid) != Some(gid) {
+                 bail!("stale subscription result");
+             }
+             let pending = self.subscription.take().expect("matched subscription");
+             let manual = pending.manual;
+             if let Err(error) = self.apply_subscription_result(pending, result) {
+                 if manual {
+                     return Err(error);
+                 }
+                 tracing::debug!(gid, "scheduled subscription refresh failed");
+             }
+         }
         Event::Log(line)=>{self.logs.push_back(line.chars().take(8192).collect());while self.logs.len()>500{self.logs.pop_front();}},
         Event::Error(e)=>{if self.testing{self.latency_error=Some(e.clone());}bail!("{e}");},
     }
@@ -974,6 +1133,16 @@ mod tests {
             assert_eq!(mixed["ok"], true, "{mixed}");
             assert_eq!(mixed["value"]["profiles"], 1);
             assert!(!mixed["value"]["errors"].as_array().unwrap().is_empty());
+            let imported = request(
+                h,
+                json!({
+                    "op":"import_links",
+                    "gid":gid,
+                    "text":r#"{"outbounds":[{"type":"socks","tag":"JSON","server":"json.example","server_port":1080}]}"#
+                }),
+            );
+            assert_eq!(imported["ok"], true, "{imported}");
+            assert_eq!(imported["value"]["profiles"], 1);
             assert_eq!(request(h, json!({"op":"check_config","id":id}))["ok"], true);
             let until = Instant::now() + Duration::from_secs(3);
             loop {
@@ -1038,16 +1207,47 @@ mod tests {
                     .len()
                     < 104
             );
+            subscription_reduction(&mut s);
             s.checking = true;
             assert!(s.mutable().is_err());
             s.checking = false;
             let mut p = nolurix_config::link::parse("trojan://pw@a.example:443#a").unwrap();
             p.gid = 1;
             let id = s.store.insert_profile(&p).unwrap();
+            let other_id = s.store.insert_profile(&p).unwrap();
             s.testing = true;
-            s.latency.insert(id, fingerprint(&s.profile(id).unwrap()));
+            s.latency_total = 2;
+            for profile_id in [id, other_id] {
+                let expected = fingerprint(&s.profile(profile_id).unwrap());
+                s.latency.insert(profile_id, expected);
+            }
+            assert_eq!(
+                s.snapshot().unwrap()["latency_progress"],
+                json!({"completed":0,"total":2})
+            );
             s.reduce(Event::LatencyResult { id, latency: 42 }).unwrap();
-            s.reduce(Event::TestFinished { tested: 1 }).unwrap();
+            assert!(s.reduce(Event::LatencyResult { id, latency: 999 }).is_err());
+            let snapshot = s.snapshot().unwrap();
+            assert_eq!(
+                snapshot["latency_progress"],
+                json!({"completed":1,"total":2})
+            );
+            let latency_for = |id: i64| {
+                snapshot["profiles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|profile| profile["id"] == id)
+                    .unwrap()["latency"]
+                    .as_i64()
+                    .unwrap()
+            };
+            assert_eq!(latency_for(id), 42);
+            assert_eq!(latency_for(other_id), 0);
+            // A cancelled run may report 0 from the engine but retain completed rows.
+            s.reduce(Event::TestFinished { tested: 0 }).unwrap();
+            assert_eq!(s.snapshot().unwrap()["latency_progress"], Value::Null);
+            assert_eq!(s.notice.as_deref(), Some("Tested: 1"));
             assert!(s.reduce(Event::LatencyResult { id, latency: 999 }).is_err());
             assert!(s.reduce(Event::TestFinished { tested: 1 }).is_err());
             s.reduce(Event::Status(Status::Connected {
@@ -1059,7 +1259,8 @@ mod tests {
             assert_eq!(s.store.profile(id).unwrap().unwrap().traffic_dl, 12);
             assert!(s.mutable().is_err());
             // Independent measurement slots remain available while connected.
-            s.request(json!({"op":"test_latency","ids":[id]})).unwrap();
+            s.request(json!({"op":"test_latency","ids":[id,id]})).unwrap();
+            assert_eq!(s.snapshot().unwrap()["latency_progress"]["total"], 1);
             s.request(json!({"op":"speed_test","id":id})).unwrap();
             s.request(json!({"op":"check_config","id":id})).unwrap();
             assert!(s.testing && s.speed_profile.is_some() && s.checking);
@@ -1114,5 +1315,76 @@ mod tests {
             s.events = actual;
             s.shutdown().unwrap();
         }
+    }
+
+    fn subscription_reduction(s: &mut State) {
+        let url = "http://["; // Invalid before sending any network traffic.
+        let gid = s
+            .store
+            .insert_group(&Group {
+                name: "Scheduled fixture".into(),
+                url: url.into(),
+                ..Group::default()
+            })
+            .unwrap();
+        s.settings.sub_auto_update = true;
+        s.status = Status::Connected {
+            profile_id: -gid,
+            name: String::new(),
+        };
+        s.next_refresh_check = Instant::now();
+        s.drain();
+        assert!(s.subscription.is_none(), "skip the active group");
+        s.status = Status::Disconnected;
+        s.checking = true;
+        s.next_refresh_check = Instant::now();
+        s.drain();
+        assert!(s.subscription.is_none(), "wait for measurements");
+        s.checking = false;
+        s.notice = Some("existing notice".into());
+        s.drain();
+        assert_eq!(s.snapshot().unwrap()["subscription_refresh_gid"], gid);
+        assert!(
+            s.mutable().is_err(),
+            "automatic refresh also guards profile writes"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while s.subscription.is_some() {
+            s.drain();
+            assert!(
+                Instant::now() < deadline,
+                "subscription fixture did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(s.notice.as_deref(), Some("existing notice"));
+        s.next_refresh_check = Instant::now();
+        s.drain();
+        assert!(s.subscription.is_none(), "failed attempts back off");
+        s.settings.sub_auto_update = false;
+
+        let link = "trojan://pw@a.example:443#a";
+        let mut p = nolurix_config::link::parse(link).unwrap();
+        p.gid = gid;
+        let id = s.store.insert_profile(&p).unwrap();
+        s.request(json!({"op":"select","id":id})).unwrap();
+        let pending = |manual| PendingSubscription {
+            gid,
+            url: url.into(),
+            manual,
+        };
+        s.subscription = Some(pending(false));
+        let result = Ok(nolurix_config::subscription::parse(link).unwrap());
+        s.reduce_report(Event::Subscription { gid, result });
+        assert_eq!(s.selected, id);
+        assert_eq!(s.notice.as_deref(), Some("existing notice"));
+        assert!(s.store.group(gid).unwrap().unwrap().sub_last_update > 0);
+
+        s.subscription = Some(pending(true));
+        let result = Ok(nolurix_config::subscription::parse("trojan://pw@b.example:443#b").unwrap());
+        s.reduce_report(Event::Subscription { gid, result });
+        assert_eq!(s.selected, 0);
+        assert_eq!(s.settings.last_profile_id, 0);
+        assert_eq!(s.notice.as_deref(), Some("Subscription: +1, =0, −1"));
     }
 }

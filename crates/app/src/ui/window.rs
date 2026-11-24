@@ -8,12 +8,20 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use nolurix_config::profile::Group;
+use nolurix_store::subscription::RefreshSchedule;
 
 use crate::engine::{Command, Event, Status};
 use crate::format;
 use crate::state::State;
 use crate::ui::sparkline::Sparkline;
 use crate::ui::{connections, dialogs, logs, prefs, servers};
+
+struct SubscriptionFetch {
+    gid: i64,
+    url: String,
+    manual: bool,
+}
 
 pub struct Window {
     pub root: adw::ApplicationWindow,
@@ -35,6 +43,9 @@ pub struct Window {
 
     /// Whether a latency test is currently running; this determines the test button label.
     testing: RefCell<bool>,
+    subscription: RefCell<Option<SubscriptionFetch>>,
+    subscription_schedule: RefCell<RefreshSchedule>,
+    ping_counts: std::cell::Cell<(usize, usize)>,
     /// Brings the interface into line with the settings: widget signals during
     /// this time do not represent user choices and must not save anything.
     syncing: std::cell::Cell<bool>,
@@ -212,6 +223,10 @@ impl Window {
         toasts.set_child(Some(&toolbar));
         root.set_content(Some(&toasts));
 
+        let subscription_schedule = RefreshSchedule::on_startup(
+            &state.store.borrow().groups().unwrap_or_default(),
+            &state.settings.borrow(),
+        );
         let window = Rc::new(Self {
             root,
             toasts,
@@ -228,11 +243,22 @@ impl Window {
             connections,
             logs,
             testing: RefCell::new(false),
+            subscription: RefCell::new(None),
+            subscription_schedule: RefCell::new(subscription_schedule),
+            ping_counts: std::cell::Cell::new((0, 0)),
             syncing: std::cell::Cell::new(false),
         });
 
         window.wire(&add_button);
         window.refresh_all();
+        let weak = Rc::downgrade(&window);
+        gtk::glib::timeout_add_seconds_local(15, move || {
+            let Some(window) = weak.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            window.refresh_due_subscription();
+            gtk::glib::ControlFlow::Continue
+        });
         window
     }
 
@@ -434,8 +460,15 @@ impl Window {
                 let now = unix_now();
                 let _ = self.state.store.borrow().set_latency(id, latency, now);
                 self.servers.update_latency(id, latency);
+                let (completed, total) = self.ping_counts.get();
+                if total > 0 {
+                    let completed = (completed + 1).min(total);
+                    self.ping_counts.set((completed, total));
+                    self.servers.set_ping_progress(completed, total);
+                }
             }
             Event::TestFinished { tested } => {
+                self.ping_counts.set((0, 0));
                 *self.testing.borrow_mut() = false;
                 self.servers.set_testing(false);
                 self.toast(&match tested {
@@ -515,53 +548,138 @@ impl Window {
         }
     }
 
+    pub fn subscription_updating(&self) -> bool {
+        self.subscription.borrow().is_some()
+    }
+
+    pub fn fetch_subscription(&self, group: Group, manual: bool) -> bool {
+        if self.subscription_updating() {
+            if manual {
+                self.toast(crate::i18n::tr(
+                    "Другая подписка уже обновляется",
+                    "A subscription is already updating",
+                ));
+            }
+            return false;
+        }
+
+        let settings = self.state.settings.borrow();
+        let result = self.state.engine.try_send(Command::FetchSubscription {
+            gid: group.id,
+            url: group.url.clone(),
+            user_agent: settings.sub_user_agent.clone(),
+            send_hwid: settings.sub_send_hwid,
+            custom_hwid_params: settings.sub_custom_hwid_params.clone(),
+        });
+        drop(settings);
+        if let Err(e) = result {
+            if manual {
+                self.toast(&first_line(&format!("{e:#}")));
+            }
+            return false;
+        }
+        self.subscription_schedule
+            .borrow_mut()
+            .record_attempt(group.id, unix_now());
+        self.servers.set_updating(Some(group.id));
+        *self.subscription.borrow_mut() = Some(SubscriptionFetch {
+            gid: group.id,
+            url: group.url,
+            manual,
+        });
+        true
+    }
+
+    fn refresh_due_subscription(&self) {
+        if self.subscription_updating()
+            || *self.testing.borrow()
+            || matches!(*self.state.status.borrow(), Status::Connecting)
+            || !self.state.settings.borrow().sub_auto_update
+        {
+            return;
+        }
+        let store = self.state.store.borrow();
+        let Ok(mut groups) = store.groups() else {
+            return;
+        };
+        let connected_id = self.state.connected_id();
+        let connected_gid = match connected_id {
+            id if id < 0 => Some(-id),
+            id if id > 0 => store.profile(id).ok().flatten().map(|profile| profile.gid),
+            _ => None,
+        };
+        drop(store);
+        groups.retain(|group| Some(group.id) != connected_gid);
+        let due = self.subscription_schedule.borrow_mut().due(
+            &groups,
+            &self.state.settings.borrow(),
+            unix_now(),
+        );
+        if let Some(group) = groups.into_iter().find(|group| Some(group.id) == due) {
+            self.fetch_subscription(group, false);
+        }
+    }
+
     fn apply_subscription(
         self: &Rc<Self>,
         gid: i64,
         result: Result<nolurix_config::subscription::Parsed, String>,
     ) {
-        self.servers.set_updating(false);
-        let parsed = match result {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                self.state
-                    .push_log(crate::tr_format!("подписка: {e}", "subscription: {e}"));
-                self.logs.refresh();
-                self.toast(&first_line(&e));
-                return;
-            }
-        };
-
-        let outcome = {
-            let mut store = self.state.store.borrow_mut();
-            store.replace_group_profiles(gid, &parsed.profiles)
-        };
+        let mut active = self.subscription.borrow_mut();
+        if active.as_ref().map(|fetch| fetch.gid) != Some(gid) {
+            return;
+        }
+        let Some(fetch) = active.take() else { return };
+        drop(active);
+        let current_group = self.state.current_gid.get() == gid;
+        self.servers.set_updating(None);
+        let outcome = result.and_then(|parsed| {
+            self.state
+                .store
+                .borrow_mut()
+                .apply_subscription(gid, &fetch.url, &parsed, unix_now())
+                .map(|counts| (counts, parsed.errors))
+                .map_err(|e| format!("{e:#}"))
+        });
         match outcome {
-            Ok((added, kept, removed)) => {
+            Ok(((added, kept, removed), errors)) => {
+                let selected = self.state.selected_id.get();
+                if removed != 0
+                    && selected > 0
+                    && matches!(self.state.store.borrow().profile(selected), Ok(None))
                 {
-                    let store = self.state.store.borrow();
-                    if let Ok(Some(mut group)) = store.group(gid) {
-                        group.info = parsed.info.clone();
-                        group.sub_last_update = unix_now();
-                        let _ = store.update_group(&group);
-                    }
+                    self.state.selected_id.set(0);
+                    let _ = self.state.save_settings();
                 }
-                self.servers.reload();
+                if current_group {
+                    self.servers.reload();
+                }
                 self.refresh_channel();
-                self.toast(&crate::tr_format!(
+                let summary = crate::tr_format!(
                     "Обновлено: {added} новых, {kept} прежних, {removed} удалено",
                     "Updated: {added} new, {kept} retained, {removed} removed"
-                ));
-                for error in parsed.errors.iter().take(5) {
+                );
+                if fetch.manual {
+                    self.toast(&summary);
+                } else {
+                    self.state.push_log(summary);
+                }
+                for error in errors.iter().take(5) {
                     self.state.push_log(crate::tr_format!(
                         "подписка: {error}",
                         "subscription: {error}"
                     ));
                 }
-                self.logs.refresh();
             }
-            Err(e) => self.toast(&first_line(&format!("{e:#}"))),
+            Err(e) => {
+                self.state
+                    .push_log(crate::tr_format!("подписка: {e}", "subscription: {e}"));
+                if fetch.manual {
+                    self.toast(&first_line(&e));
+                }
+            }
         }
+        self.logs.refresh();
     }
 
     pub fn refresh_all(self: &Rc<Self>) {
@@ -664,13 +782,19 @@ impl Window {
             return;
         }
         let ids = profiles.iter().map(|p| p.id).collect();
-        *self.testing.borrow_mut() = true;
-        self.servers.set_testing(true);
-        self.state.engine.send(Command::TestLatency {
+        let total = profiles.len();
+        if let Err(e) = self.state.engine.try_send(Command::TestLatency {
             profiles,
             ids,
             settings: Box::new(self.state.settings.borrow().clone()),
-        });
+        }) {
+            self.toast(&first_line(&format!("{e:#}")));
+            return;
+        }
+        self.ping_counts.set((0, total));
+        self.servers.set_ping_progress(0, total);
+        *self.testing.borrow_mut() = true;
+        self.servers.set_testing(true);
     }
 
     /// Asks auto-selection to recalculate its ranking right now.
