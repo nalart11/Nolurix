@@ -317,7 +317,8 @@ struct MainView: View {
         field.isAutomaticDashSubstitutionEnabled = false
         field.isVerticallyResizable = true
         field.autoresizingMask = [.width]
-        field.maxSize = NSSize(width: .greatestFiniteMagnitude, height: .greatestFiniteMagnitude)
+        let maxDimension = CGFloat.greatestFiniteMagnitude
+        field.maxSize = NSSize(width: maxDimension, height: maxDimension)
         field.textContainer?.widthTracksTextView = true
         field.textContainerInset = NSSize(width: 8, height: 8)
         field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
